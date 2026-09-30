@@ -86,7 +86,7 @@ JUDGMENTS: list[tuple[str, list[str]]] = [
 ]
 
 # Floors, not targets. Measured on the roster at the time of writing:
-# recall@1 0.80, recall@3 0.92, and 47 of 279 agents returned per query.
+# recall@1 0.84, recall@3 0.92, and 49 of 279 agents returned per query.
 MIN_RECALL_AT_1 = 0.68
 MIN_RECALL_AT_3 = 0.84
 MAX_MEAN_RESULTS_FRACTION = 0.35
@@ -185,11 +185,11 @@ class SearchQuality(unittest.TestCase):
             f"{self.stats['roster']} agents on average")
 
     def test_a_query_term_does_not_match_a_word_it_only_sits_inside(self):
-        """'go' is not a hit on Godot, 'ai' is not a hit on Email."""
+        """'go' is not a hit on Godot, 'rust' is not a hit on Trust."""
         module = self.module
         module._build_index()
         for term, slug in (("go", "godot-multiplayer-engineer"),
-                           ("ai", "email-marketing-strategist"),
+                           ("rust", "agentic-identity-trust-architect"),
                            ("art", "drupal-shopping-cart-engineer")):
             agent = next((a for a in module._load_agents() if a["slug"] == slug), None)
             if agent is None:
@@ -198,6 +198,36 @@ class SearchQuality(unittest.TestCase):
             self.assertEqual(
                 score, 0.0,
                 f"{slug} still scores on {term!r}, which only appears inside a longer word")
+
+    def test_a_query_term_matches_a_segment_of_a_compound_word(self):
+        """'ops' finds DevOps, FinOps and SecOps; 'sec' finds SecOps.
+
+        Whole-word matching alone loses these, and this roster is full of
+        compounds. What separates Dev|Ops from T|rust is the case change, so
+        the segment rule must not bring back the substring matches above.
+        """
+        for query, wanted in (
+                ("ops", {"devops-automator", "finops-engineer", "senior-secops-engineer"}),
+                ("sec", {"senior-secops-engineer"})):
+            top = {agent["slug"] for _s, agent in rank(self.module, query)[:len(wanted)]}
+            self.assertEqual(top, wanted, f"top results for {query!r}")
+
+    def test_a_segment_match_ranks_below_the_same_whole_word(self):
+        """An agent named for the term beats one that only has it in a compound."""
+        results = [agent["slug"] for _s, agent in rank(self.module, "rust")]
+        self.assertEqual(results[0], "rust-refactoring-specialist")
+
+    def test_a_word_at_the_end_of_a_sentence_is_still_that_word(self):
+        """'Rust.' is the token rust, not 'rust.'."""
+        self.assertIn("rust", self.module._tokens("Written in Rust."))
+        self.assertIn("c++", self.module._tokens("Ported to C++."))
+        self.assertIn("node.js", self.module._tokens("Runs on Node.js."))
+
+    def test_a_one_word_query_gets_no_phrase_bonus_from_a_substring(self):
+        """'ops' inside 'develops' used to be worth the full phrase bonus."""
+        module = self.module
+        self.assertFalse(module._phrase_in("ops", "the team develops tools"))
+        self.assertTrue(module._phrase_in("press release", "write a press release."))
 
     def test_a_query_of_only_stop_words_does_not_crash(self):
         module = self.module

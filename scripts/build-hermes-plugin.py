@@ -166,6 +166,21 @@ _PREFIX_MIN = 5
 # Below this a result is noise rather than a weak answer.
 _MIN_SCORE = 1.5
 
+# A query term that only matches one segment of a compound word ("ops" in
+# DevOps, "sql" in PostgreSQL, "js" in Node.js) counts for this fraction of
+# what a whole-word match in the same field would. It has to count for
+# something: "ops" is a natural thing to type, and the roster spells most of
+# its compounds as one word. It has to count for less: the agent named "Ops
+# Lead" is a better answer to "ops" than the one that mentions DevOps once.
+_COMPOUND_WEIGHT = 0.6
+
+# Where a compound splits: a lower-to-upper case change (DevOps, GraphQL), an
+# acronym before a capitalised word (SQLServer), or a letter/digit change.
+# Case is the only thing that separates "Dev|Ops" from "t|rust", so this runs
+# on the original text, before anything is lowercased.
+_SEGMENT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+_JOINER_RE = re.compile(r"[._+#-]+")
+
 # Query words that say nothing about which specialist is wanted. Searches
 # arrive as questions ("who can help me review my api"), so most of a query is
 # usually this list; scoring these like real terms drowns out the one word that
@@ -188,7 +203,33 @@ def _load_agents() -> list[dict[str, Any]]:
 
 
 def _tokens(text: str) -> set[str]:
-    return {token.lower() for token in _WORD_RE.findall(text or "")}
+    # _WORD_RE lets "." "-" "_" through so node.js, ci-cd and snake_case stay
+    # whole, but that also swept up sentence punctuation: "Rust." at the end
+    # of a sentence was the token "rust.", and a query for rust missed it.
+    # Trailing + and # are kept; they are the point of c++ and c#.
+    return {token.lower().rstrip("._-") for token in _WORD_RE.findall(text or "")}
+
+
+def _segments(text: str) -> set[str]:
+    """Pieces of compound words, lowercased: DevOps -> dev, ops; Node.js ->
+    node, js; PostgreSQL -> postgre, sql.
+
+    Only words that actually split contribute, and only pieces of two or more
+    characters. "Trust" has no case change inside it, so "rust" is not one of
+    its segments; that is the whole point of splitting on case rather than
+    matching substrings. An all-caps plural ("APIs", "LLMs") is one word with
+    an s on the end, not two segments.
+    """
+    out: set[str] = set()
+    for word in _WORD_RE.findall(text or ""):
+        if re.fullmatch(r"[A-Z]{2,}s", word):
+            continue
+        pieces = [piece.lower()
+                  for chunk in _JOINER_RE.split(word) if chunk
+                  for piece in _SEGMENT_RE.findall(chunk)]
+        if len(pieces) > 1:
+            out.update(piece for piece in pieces if len(piece) >= 2)
+    return out
 
 
 def _agent_lookup(identifier: str) -> dict[str, Any] | None:
@@ -239,6 +280,18 @@ def _build_index() -> dict[str, dict[str, Any]]:
             "vibe": _tokens(agent.get("vibe", "")),
         }
         body = _tokens(agent.get("body", "")[:_BODY_HEAD_CHARS])
+        # Segments are kept apart from whole tokens so a match on one can be
+        # scored lower. A segment that is also a whole word in the same field
+        # is just that word. The body is left out: a body mentions WordPress
+        # and JavaScript in passing, and "press" or "script" from there only
+        # adds noise to queries about press releases and scripts.
+        parts = {
+            "name": _segments(agent.get("name", "")),
+            "description": _segments(agent.get("description", "")),
+            "division": _segments(agent.get("division", "")),
+            "vibe": _segments(agent.get("vibe", "")),
+        }
+        parts = {field: parts[field] - fields[field] for field in parts}
         text = "\n".join([
             agent.get("name", ""),
             agent.get("description", ""),
@@ -246,8 +299,9 @@ def _build_index() -> dict[str, dict[str, Any]]:
             agent.get("vibe", ""),
             agent.get("body", "")[:_BODY_HEAD_CHARS],
         ]).lower()
-        index[agent["slug"]] = {"fields": fields, "body": body, "text": text}
-        for term in body.union(*fields.values()):
+        index[agent["slug"]] = {"fields": fields, "body": body, "text": text,
+                                "parts": parts}
+        for term in body.union(*fields.values(), *parts.values()):
             doc_freq[term] = doc_freq.get(term, 0) + 1
     total = max(len(agents), 1)
     _IDF = {term: math.log(1.0 + total / count) for term, count in doc_freq.items()}
@@ -290,22 +344,35 @@ def _expansions(term: str) -> set[str]:
     return matches or {term}
 
 
+def _phrase_in(phrase: str, text: str) -> bool:
+    """True if <phrase> occurs in <text> on word boundaries at both ends."""
+    phrase = phrase.strip()
+    if not phrase:
+        return False
+    return re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", text) is not None
+
+
 def _score(agent: dict[str, Any], query_terms: dict[str, set[str]], query_text: str) -> float:
     entry = _build_index().get(agent.get("slug", ""))
     if entry is None or not query_terms:
         return 0.0
     fields = entry["fields"]
+    parts = entry["parts"]
     score = 0.0
     matched = 0
     titled = 0  # matched somewhere other than the body
     for candidates in query_terms.values():
+        # The best place this term lands: a whole word in a field, else a
+        # segment of a compound in a field, else the body.
         weight = 0.0
         for field, field_weight in _FIELD_WEIGHT.items():
-            if fields[field] & candidates and field_weight > weight:
-                weight = field_weight
+            if fields[field] & candidates:
+                weight = max(weight, field_weight)
+            elif parts[field] & candidates:
+                weight = max(weight, field_weight * _COMPOUND_WEIGHT)
         hits = candidates & entry["body"]
-        for field_tokens in fields.values():
-            hits |= candidates & field_tokens
+        for field in fields:
+            hits |= candidates & (fields[field] | parts[field])
         if not hits:
             continue
         if weight:
@@ -316,7 +383,11 @@ def _score(agent: dict[str, Any], query_terms: dict[str, set[str]], query_text: 
         score += weight * max(_IDF.get(hit, _IDF_DEFAULT) for hit in hits)
     if not matched:
         return 0.0
-    if query_text and query_text in entry["text"]:
+    # The phrase bonus is for a multi-word query that appears as written. It
+    # used to be a bare substring test, which let a one-word query back in
+    # through the side door: "ops" is a substring of "develops" and "stops", so
+    # every agent that mentions either got the full bonus for it.
+    if len(query_terms) > 1 and query_text and _phrase_in(query_text, entry["text"]):
         score += _PHRASE_BONUS
     # Covering more of the query beats spiking on a single term.
     score *= _COVERAGE_FLOOR + (1.0 - _COVERAGE_FLOOR) * matched / len(query_terms)
